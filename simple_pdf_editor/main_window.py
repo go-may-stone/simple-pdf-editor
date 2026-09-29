@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 import json
 from pathlib import Path
 
 import fitz
-from PySide6.QtCore import QPoint, QPointF, QRectF, QSignalBlocker, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QMimeData, QPoint, QPointF, QRectF, QSignalBlocker, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -65,6 +66,10 @@ from .pdf_io import export_pdf
 
 
 SELECT_TOOL = "select"
+PIXMAP_CACHE_MAX_ITEMS = 8
+PIXMAP_CACHE_MAX_BYTES = 128 * 1024 * 1024
+ZOOM_RENDER_DELAY_MS = 140
+HISTORY_DEBOUNCE_MS = 250
 TOOL_LABELS = {
     SELECT_TOOL: "選択",
     TEXT_KIND: "文字",
@@ -73,6 +78,39 @@ TOOL_LABELS = {
     LINE_KIND: "直線",
     ARROW_KIND: "矢印",
 }
+TOOL_HELP = {
+    SELECT_TOOL: "選択: 追加した文字や図形をクリックして、移動・サイズ変更できます。",
+    TEXT_KIND: "文字: PDF上の入力したい場所をクリックします。Ctrl+Enterで確定、Escでキャンセルできます。",
+    RECT_KIND: "四角: PDF上でドラッグして四角形を追加します。Shiftを押すと正方形になります。",
+    ELLIPSE_KIND: "楕円: PDF上でドラッグして楕円を追加します。Shiftを押すと円になります。",
+    LINE_KIND: "直線: PDF上でドラッグして直線を追加します。Shiftを押すと水平・垂直になります。",
+    ARROW_KIND: "矢印: PDF上でドラッグして矢印を追加します。Shiftを押すと水平・垂直になります。",
+}
+USAGE_HELP_TEXT = """基本の流れ
+
+1. 「開く」またはドラッグ＆ドロップで PDF / .pdfedit を開きます。
+2. ツールバーで「文字」「四角」「楕円」「直線」「矢印」を選びます。
+3. PDF上をクリックまたはドラッグして追加します。
+4. 追加したものを選択し、右側の設定で位置・色・線幅・文字を調整します。
+5. 「保存」は編集状態を .pdfedit に保存します。「PDF出力」は注釈を焼き込んだPDFを作ります。
+
+便利な操作
+
+・Ctrl+ホイール: 拡大 / 縮小
+・Delete: 選択中の項目を削除
+・Ctrl+C / Ctrl+V: コピー / 貼り付け
+・Ctrl+Z / Ctrl+Y: 元に戻す / やり直す
+・文字入力中は Ctrl+Enter で確定、Esc でキャンセル
+"""
+
+
+def dropped_document_path(mime_data: QMimeData) -> Path | None:
+    for url in mime_data.urls():
+        if url.isLocalFile():
+            path = Path(url.toLocalFile())
+            if path.suffix.lower() in {".pdf", ".pdfedit"}:
+                return path
+    return None
 
 
 class ColorButton(QPushButton):
@@ -158,6 +196,7 @@ class InlineTextEdit(QTextEdit):
 class PdfGraphicsView(QGraphicsView):
     zoomRequested = Signal(int)
     contextMenuRequestedAt = Signal(QPoint)
+    documentDropped = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -166,6 +205,27 @@ class PdfGraphicsView(QGraphicsView):
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event) -> None:
+        if dropped_document_path(event.mimeData()) is not None:
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        if dropped_document_path(event.mimeData()) is not None:
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event) -> None:
+        path = dropped_document_path(event.mimeData())
+        if path is not None:
+            event.acceptProposedAction()
+            self.documentDropped.emit(path)
+            return
+        super().dropEvent(event)
 
     def wheelEvent(self, event) -> None:
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -361,12 +421,28 @@ class MainWindow(QMainWindow):
         self._inline_annotation_id: str | None = None
         self._inline_item: AnnotationItem | None = None
 
+        self._page_pixmap_cache: OrderedDict[tuple[int, float], tuple[QPixmap, int]] = OrderedDict()
+        self._page_pixmap_cache_bytes = 0
+        self._rendered_page_index: int | None = None
+        self._rendered_render_scale = 0.0
+        self._page_list_labels: list[str] = []
+
+        self._zoom_render_timer = QTimer(self)
+        self._zoom_render_timer.setSingleShot(True)
+        self._zoom_render_timer.timeout.connect(self._render_current_page)
+
+        self._history_timer = QTimer(self)
+        self._history_timer.setSingleShot(True)
+        self._history_timer.timeout.connect(self._record_pending_history)
+        self._pending_history_mark_dirty = False
+
         self.scene = PdfScene(self)
         self.view = PdfGraphicsView(self)
         self.view.setScene(self.scene)
         self.setCentralWidget(self.view)
 
         self._create_actions()
+        self._create_menus()
         self._create_toolbar()
         self._create_page_dock()
         self._create_properties_dock()
@@ -374,9 +450,11 @@ class MainWindow(QMainWindow):
         self._connect_signals()
 
         self.setAcceptDrops(True)
+        self._show_empty_guide()
         self._update_title()
         self._update_actions()
-        self.statusBar().showMessage("PDFを開いてください")
+        self._update_guidance()
+        self.statusBar().showMessage("PDFを開いてください", 3000)
 
     def closeEvent(self, event) -> None:
         if self._maybe_save():
@@ -385,73 +463,97 @@ class MainWindow(QMainWindow):
             event.ignore()
 
     def dragEnterEvent(self, event) -> None:
-        if any(url.toLocalFile().lower().endswith((".pdf", ".pdfedit")) for url in event.mimeData().urls()):
+        if dropped_document_path(event.mimeData()) is not None:
             event.acceptProposedAction()
             return
         super().dragEnterEvent(event)
 
+    def dragMoveEvent(self, event) -> None:
+        if dropped_document_path(event.mimeData()) is not None:
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
     def dropEvent(self, event) -> None:
-        for url in event.mimeData().urls():
-            path = Path(url.toLocalFile())
-            if path.suffix.lower() in {".pdf", ".pdfedit"}:
-                self._open_path(path)
-                event.acceptProposedAction()
-                return
+        path = dropped_document_path(event.mimeData())
+        if path is not None:
+            event.acceptProposedAction()
+            self._open_path(path)
+            return
         super().dropEvent(event)
 
     def _create_actions(self) -> None:
         style = self.style()
         self.open_action = QAction(style.standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton), "開く", self)
         self.open_action.setShortcut(QKeySequence.StandardKey.Open)
+        self._set_action_help(self.open_action, "PDFまたは編集ファイルを開きます。ドラッグ＆ドロップでも開けます。")
         self.open_action.triggered.connect(self.open_file)
 
         self.save_action = QAction(style.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton), "保存", self)
         self.save_action.setShortcut(QKeySequence.StandardKey.Save)
+        self._set_action_help(self.save_action, "編集状態を .pdfedit として保存します。")
         self.save_action.triggered.connect(self.save_edit)
 
         self.export_action = QAction(style.standardIcon(QStyle.StandardPixmap.SP_DriveHDIcon), "PDF出力", self)
         self.export_action.setShortcut(QKeySequence("Ctrl+E"))
+        self._set_action_help(self.export_action, "注釈を焼き込んだPDFを書き出します。")
         self.export_action.triggered.connect(self.export_pdf)
 
         self.undo_action = QAction(style.standardIcon(QStyle.StandardPixmap.SP_ArrowBack), "元に戻す", self)
         self.undo_action.setShortcut(QKeySequence.StandardKey.Undo)
+        self._set_action_help(self.undo_action, "直前の編集を元に戻します。")
         self.undo_action.triggered.connect(self.undo)
 
         self.redo_action = QAction(style.standardIcon(QStyle.StandardPixmap.SP_ArrowForward), "やり直す", self)
         self.redo_action.setShortcut(QKeySequence.StandardKey.Redo)
+        self._set_action_help(self.redo_action, "元に戻した編集をやり直します。")
         self.redo_action.triggered.connect(self.redo)
 
         self.copy_action = QAction("コピー", self)
         self.copy_action.setShortcut(QKeySequence.StandardKey.Copy)
+        self._set_action_help(self.copy_action, "選択中の文字や図形をコピーします。")
         self.copy_action.triggered.connect(self.copy_selected)
 
         self.paste_action = QAction("貼り付け", self)
         self.paste_action.setShortcut(QKeySequence.StandardKey.Paste)
+        self._set_action_help(self.paste_action, "コピーした文字や図形を現在のページに貼り付けます。")
         self.paste_action.triggered.connect(self.paste_annotation)
 
         self.delete_action = QAction("削除", self)
         self.delete_action.setShortcut(QKeySequence.StandardKey.Delete)
+        self._set_action_help(self.delete_action, "選択中の文字や図形を削除します。")
         self.delete_action.triggered.connect(self.delete_selected)
 
         self.front_action = QAction("前面へ", self)
+        self._set_action_help(self.front_action, "選択中の項目を前面に移動します。")
         self.front_action.triggered.connect(self.bring_to_front)
 
         self.back_action = QAction("背面へ", self)
+        self._set_action_help(self.back_action, "選択中の項目を背面に移動します。")
         self.back_action.triggered.connect(self.send_to_back)
 
         self.zoom_in_action = QAction(style.standardIcon(QStyle.StandardPixmap.SP_ArrowUp), "拡大", self)
         self.zoom_in_action.setShortcut(QKeySequence.StandardKey.ZoomIn)
+        self._set_action_help(self.zoom_in_action, "表示を拡大します。Ctrl+ホイールでも操作できます。")
         self.zoom_in_action.triggered.connect(lambda: self.change_zoom(1))
 
         self.zoom_out_action = QAction(style.standardIcon(QStyle.StandardPixmap.SP_ArrowDown), "縮小", self)
         self.zoom_out_action.setShortcut(QKeySequence.StandardKey.ZoomOut)
+        self._set_action_help(self.zoom_out_action, "表示を縮小します。Ctrl+ホイールでも操作できます。")
         self.zoom_out_action.triggered.connect(lambda: self.change_zoom(-1))
 
         self.prev_page_action = QAction("前", self)
+        self._set_action_help(self.prev_page_action, "前のページへ移動します。")
         self.prev_page_action.triggered.connect(lambda: self.go_to_page(self.current_page - 1))
 
         self.next_page_action = QAction("次", self)
+        self._set_action_help(self.next_page_action, "次のページへ移動します。")
         self.next_page_action.triggered.connect(lambda: self.go_to_page(self.current_page + 1))
+
+        self.help_action = QAction(style.standardIcon(QStyle.StandardPixmap.SP_MessageBoxQuestion), "使い方", self)
+        self.help_action.setShortcut(QKeySequence("F1"))
+        self._set_action_help(self.help_action, "基本操作とショートカットを表示します。")
+        self.help_action.triggered.connect(self.show_usage_help)
 
         self.tool_group = QActionGroup(self)
         self.tool_group.setExclusive(True)
@@ -460,6 +562,7 @@ class MainWindow(QMainWindow):
             action = QAction(label, self)
             action.setCheckable(True)
             action.setData(tool)
+            self._set_action_help(action, TOOL_HELP.get(tool, label))
             action.triggered.connect(self._tool_action_triggered)
             self.tool_group.addAction(action)
             self.tool_actions[tool] = action
@@ -470,6 +573,30 @@ class MainWindow(QMainWindow):
         self.addAction(self.delete_action)
         self.addAction(self.undo_action)
         self.addAction(self.redo_action)
+
+    def _set_action_help(self, action: QAction, text: str) -> None:
+        action.setToolTip(text)
+        action.setStatusTip(text)
+
+    def _create_menus(self) -> None:
+        file_menu = self.menuBar().addMenu("ファイル")
+        file_menu.addAction(self.open_action)
+        file_menu.addAction(self.save_action)
+        file_menu.addAction(self.export_action)
+
+        edit_menu = self.menuBar().addMenu("編集")
+        edit_menu.addAction(self.undo_action)
+        edit_menu.addAction(self.redo_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.copy_action)
+        edit_menu.addAction(self.paste_action)
+        edit_menu.addAction(self.delete_action)
+        edit_menu.addSeparator()
+        edit_menu.addAction(self.front_action)
+        edit_menu.addAction(self.back_action)
+
+        help_menu = self.menuBar().addMenu("ヘルプ")
+        help_menu.addAction(self.help_action)
 
     def _create_toolbar(self) -> None:
         toolbar = QToolBar("ツール", self)
@@ -493,16 +620,20 @@ class MainWindow(QMainWindow):
         self.page_spin.setMinimum(1)
         self.page_spin.setMaximum(1)
         self.page_spin.setFixedWidth(78)
+        self.page_spin.setToolTip("ページ番号を入力して移動します。")
         toolbar.addWidget(self.page_spin)
         toolbar.addAction(self.next_page_action)
         toolbar.addSeparator()
         toolbar.addAction(self.zoom_out_action)
         toolbar.addAction(self.zoom_in_action)
+        toolbar.addSeparator()
+        toolbar.addAction(self.help_action)
 
     def _create_page_dock(self) -> None:
         self.page_list = QListWidget(self)
         self.page_list.setMinimumWidth(96)
         self.page_list.setUniformItemSizes(True)
+        self.page_list.setToolTip("クリックするとページを移動します。* は編集済みページです。")
         dock = QDockWidget("ページ", self)
         dock.setObjectName("pageDock")
         dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
@@ -516,6 +647,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(8)
 
         self.no_selection_label = QLabel("オブジェクト未選択", panel)
+        self.no_selection_label.setToolTip("PDF上の文字や図形を選ぶと、ここで位置や色を調整できます。")
         layout.addWidget(self.no_selection_label)
 
         self.common_group = QGroupBox("位置とサイズ", panel)
@@ -537,6 +669,7 @@ class MainWindow(QMainWindow):
         self.text_content = QTextEdit(self.text_group)
         self.text_content.setAcceptRichText(False)
         self.text_content.setFixedHeight(84)
+        self.text_content.setPlaceholderText("入力する文字")
         self.font_combo = QFontComboBox(self.text_group)
         self.font_size_spin = self._make_double_spin(1.0, 200.0, 14.0)
         self.text_color_button = ColorButton("文字色", self.text_group)
@@ -590,10 +723,49 @@ class MainWindow(QMainWindow):
         self.shape_group.setVisible(False)
 
     def _create_status_bar(self) -> None:
+        self.guide_status_label = QLabel("", self)
+        self.guide_status_label.setMinimumWidth(420)
         self.page_status_label = QLabel("ページ -/-", self)
         self.zoom_status_label = QLabel("100%", self)
+        self.statusBar().addWidget(self.guide_status_label, 1)
         self.statusBar().addPermanentWidget(self.page_status_label)
         self.statusBar().addPermanentWidget(self.zoom_status_label)
+
+    def _show_empty_guide(self) -> None:
+        self.scene.clear()
+        self.scene.setSceneRect(QRectF(0.0, 0.0, 760.0, 420.0))
+        self.view.setTransform(QTransform())
+
+        guide = self.scene.addText(
+            "PDFを開くか、ここにドラッグ＆ドロップしてください\n\n"
+            "文字や図形を追加するときは、上のツールを選んでPDF上をクリックまたはドラッグします。\n"
+            "編集状態は「保存」、完成したPDFは「PDF出力」から作成します。"
+        )
+        font = QFont()
+        font.setPointSize(13)
+        guide.setFont(font)
+        guide.setDefaultTextColor(QColor("#5f6368"))
+        guide.setTextWidth(600)
+        guide.setPos(80, 120)
+
+    def show_usage_help(self) -> None:
+        QMessageBox.information(self, "使い方", USAGE_HELP_TEXT)
+
+    def _guidance_text(self) -> str:
+        if not self._has_document():
+            return "PDFを開くか、ここにドラッグ＆ドロップしてください。"
+        if self._inline_proxy:
+            return "文字入力中: Ctrl+Enterで確定、Escでキャンセルできます。"
+        item = self._selected_item()
+        if item:
+            if item.annotation.kind == TEXT_KIND:
+                return "選択中: 右側で文字・色・位置を調整できます。ダブルクリックで本文を直接編集できます。"
+            return "選択中: ドラッグで移動、角のハンドルでサイズ変更、右側で色や線幅を調整できます。"
+        return TOOL_HELP.get(self.scene.current_tool, "ツールを選んでPDF上で操作してください。")
+
+    def _update_guidance(self) -> None:
+        if hasattr(self, "guide_status_label"):
+            self.guide_status_label.setText(self._guidance_text())
 
     def _connect_signals(self) -> None:
         self.scene.annotationCreated.connect(self._annotation_created)
@@ -602,6 +774,7 @@ class MainWindow(QMainWindow):
         self.scene.selectionChanged.connect(self._selection_changed)
         self.view.zoomRequested.connect(self.change_zoom)
         self.view.contextMenuRequestedAt.connect(self.show_context_menu)
+        self.view.documentDropped.connect(self._open_path)
         self.page_list.currentRowChanged.connect(self.go_to_page)
         self.page_spin.valueChanged.connect(lambda value: self.go_to_page(value - 1))
 
@@ -702,6 +875,7 @@ class MainWindow(QMainWindow):
         if not self._has_document():
             return False
         self._commit_inline_editor()
+        self._flush_pending_history()
         if self.edit_path is None:
             default_path = self.pdf_path.with_suffix(".pdfedit") if self.pdf_path else Path.home() / "untitled.pdfedit"
             path, _ = QFileDialog.getSaveFileName(
@@ -728,6 +902,7 @@ class MainWindow(QMainWindow):
         if not self._has_document():
             return
         self._commit_inline_editor()
+        self._flush_pending_history()
         default_path = self.pdf_path.with_name(f"{self.pdf_path.stem}_edited.pdf") if self.pdf_path else Path.home() / "edited.pdf"
         path, _ = QFileDialog.getSaveFileName(
             self,
@@ -761,8 +936,21 @@ class MainWindow(QMainWindow):
         if not self._has_document():
             return
         factor = 1.15 ** steps
-        self.zoom = max(0.25, min(4.0, self.zoom * factor))
-        self._render_current_page()
+        new_zoom = max(0.25, min(4.0, self.zoom * factor))
+        if abs(new_zoom - self.zoom) < 0.001:
+            return
+        self.zoom = new_zoom
+        self.view.setTransform(QTransform().scale(self.zoom, self.zoom))
+        self._update_status()
+
+        target_render_scale = self._render_scale_key(max(1.0, self.zoom))
+        if (
+            self._rendered_page_index == self.current_page
+            and self._render_scale_key(self._rendered_render_scale) == self._render_scale_key(target_render_scale)
+        ):
+            self._zoom_render_timer.stop()
+            return
+        self._zoom_render_timer.start(ZOOM_RENDER_DELAY_MS)
 
     def copy_selected(self) -> None:
         item = self._selected_item()
@@ -812,16 +1000,18 @@ class MainWindow(QMainWindow):
         self._record_history()
 
     def undo(self) -> None:
+        self._commit_inline_editor()
+        self._flush_pending_history()
         if self.history_index <= 0:
             return
-        self._commit_inline_editor()
         self.history_index -= 1
         self._restore_history()
 
     def redo(self) -> None:
+        self._commit_inline_editor()
+        self._flush_pending_history()
         if self.history_index >= len(self.history) - 1:
             return
-        self._commit_inline_editor()
         self.history_index += 1
         self._restore_history()
 
@@ -860,6 +1050,7 @@ class MainWindow(QMainWindow):
         self._inline_proxy = proxy
         self._inline_annotation_id = annotation.id
         self._inline_item = item
+        self._update_guidance()
         QTimer.singleShot(0, editor.setFocus)
 
     def _finish_text_edit(self, annotation_id: str, text: str) -> None:
@@ -878,6 +1069,7 @@ class MainWindow(QMainWindow):
             item.setSelected(True)
         self._record_history()
         self._selection_changed()
+        self._update_guidance()
 
     def _cancel_text_edit(self, annotation_id: str) -> None:
         annotation = self._annotation_by_id(annotation_id)
@@ -886,6 +1078,7 @@ class MainWindow(QMainWindow):
             self._inline_item.setVisible(True)
         if annotation and not annotation.text.strip():
             self._delete_annotation(annotation_id, record=True)
+        self._update_guidance()
 
     def _remove_inline_editor(self) -> None:
         if self._inline_item:
@@ -914,29 +1107,31 @@ class MainWindow(QMainWindow):
 
     def _annotation_changed(self, annotation: Annotation) -> None:
         self._record_history()
-        self._populate_page_list()
         self._selection_changed()
 
     def _selection_changed(self) -> None:
         self._update_properties_from_selection()
         self._update_actions()
+        self._update_guidance()
 
     def _render_current_page(self) -> None:
+        self._zoom_render_timer.stop()
         if not self._has_document():
-            self.scene.clear()
+            self._show_empty_guide()
+            self._update_guidance()
             return
 
         self.scene.clear()
         page = self.pdf_doc[self.current_page]
         page_rect = QRectF(0.0, 0.0, float(page.rect.width), float(page.rect.height))
-        render_scale = max(1.0, self.zoom)
-        pix = page.get_pixmap(matrix=fitz.Matrix(render_scale, render_scale), alpha=False)
-        image = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
-        pixmap = QPixmap.fromImage(image)
+        render_scale = self._render_scale_key(max(1.0, self.zoom))
+        pixmap = self._page_pixmap(self.current_page, render_scale)
 
         background = self.scene.addPixmap(pixmap)
         background.setScale(1.0 / render_scale)
         background.setZValue(-10000)
+        self._rendered_page_index = self.current_page
+        self._rendered_render_scale = render_scale
         self.scene.set_page(self.current_page, page_rect, self._next_z())
 
         for annotation in sorted(self._annotations_for_current_page(), key=lambda item: item.z):
@@ -946,17 +1141,57 @@ class MainWindow(QMainWindow):
         self._sync_page_controls()
         self._update_status()
         self._update_properties_from_selection()
+        self._update_guidance()
+
+    def _page_pixmap(self, page_index: int, render_scale: float) -> QPixmap:
+        key = (page_index, self._render_scale_key(render_scale))
+        cached = self._page_pixmap_cache.pop(key, None)
+        if cached is not None:
+            self._page_pixmap_cache[key] = cached
+            return cached[0]
+
+        page = self.pdf_doc[page_index]
+        pix = page.get_pixmap(matrix=fitz.Matrix(render_scale, render_scale), alpha=False)
+        image = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
+        pixmap = QPixmap.fromImage(image)
+        cost = pixmap.width() * pixmap.height() * max(1, pixmap.depth() // 8)
+        self._page_pixmap_cache[key] = (pixmap, cost)
+        self._page_pixmap_cache_bytes += cost
+        self._trim_page_pixmap_cache()
+        return pixmap
+
+    def _trim_page_pixmap_cache(self) -> None:
+        while self._page_pixmap_cache and (
+            len(self._page_pixmap_cache) > PIXMAP_CACHE_MAX_ITEMS
+            or self._page_pixmap_cache_bytes > PIXMAP_CACHE_MAX_BYTES
+        ):
+            _key, (_pixmap, cost) = self._page_pixmap_cache.popitem(last=False)
+            self._page_pixmap_cache_bytes -= cost
+
+    def _clear_page_pixmap_cache(self) -> None:
+        self._page_pixmap_cache.clear()
+        self._page_pixmap_cache_bytes = 0
+        self._rendered_page_index = None
+        self._rendered_render_scale = 0.0
+
+    def _render_scale_key(self, render_scale: float) -> float:
+        return round(render_scale, 3)
 
     def _populate_page_list(self) -> None:
         if not self._has_document():
             self.page_list.clear()
+            self._page_list_labels = []
             return
         blockers = [QSignalBlocker(self.page_list)]
         edited_pages = {annotation.page for annotation in self.annotations}
-        self.page_list.clear()
+        labels = []
         for index in range(self.pdf_doc.page_count):
             mark = " *" if index in edited_pages else ""
-            self.page_list.addItem(f"{index + 1}{mark}")
+            labels.append(f"{index + 1}{mark}")
+        if labels != self._page_list_labels or self.page_list.count() != len(labels):
+            self.page_list.clear()
+            self.page_list.addItems(labels)
+            self._page_list_labels = labels
         self.page_list.setCurrentRow(self.current_page)
         blockers.clear()
 
@@ -1050,7 +1285,7 @@ class MainWindow(QMainWindow):
         annotation.w = self.w_spin.value()
         annotation.h = self.h_spin.value()
         item.sync_from_annotation()
-        self._record_history()
+        self._schedule_history()
 
     def _text_content_changed(self) -> None:
         item = self._selected_item()
@@ -1058,7 +1293,7 @@ class MainWindow(QMainWindow):
             return
         item.annotation.text = self.text_content.toPlainText()
         item.update()
-        self._record_history()
+        self._schedule_history()
 
     def _font_changed(self, font: QFont) -> None:
         item = self._selected_item()
@@ -1067,7 +1302,7 @@ class MainWindow(QMainWindow):
         item.annotation.font_family = font.family()
         item.update()
         self.scene.defaults["font_family"] = font.family()
-        self._record_history()
+        self._schedule_history()
 
     def _font_size_changed(self, value: float) -> None:
         item = self._selected_item()
@@ -1076,7 +1311,7 @@ class MainWindow(QMainWindow):
         item.annotation.font_size = value
         item.update()
         self.scene.defaults["font_size"] = value
-        self._record_history()
+        self._schedule_history()
 
     def _text_color_changed(self, color: str) -> None:
         item = self._selected_item()
@@ -1085,7 +1320,7 @@ class MainWindow(QMainWindow):
         item.annotation.text_color = color
         item.update()
         self.scene.defaults["text_color"] = color
-        self._record_history()
+        self._schedule_history()
 
     def _text_background_toggled(self, checked: bool) -> None:
         item = self._selected_item()
@@ -1093,7 +1328,7 @@ class MainWindow(QMainWindow):
             return
         item.annotation.background_color = self.text_bg_button.color() if checked else ""
         item.update()
-        self._record_history()
+        self._schedule_history()
 
     def _text_background_changed(self, color: str) -> None:
         item = self._selected_item()
@@ -1102,7 +1337,7 @@ class MainWindow(QMainWindow):
         if self.text_bg_check.isChecked():
             item.annotation.background_color = color
             item.update()
-            self._record_history()
+            self._schedule_history()
 
     def _text_border_toggled(self, checked: bool) -> None:
         item = self._selected_item()
@@ -1110,7 +1345,7 @@ class MainWindow(QMainWindow):
             return
         item.annotation.border_enabled = checked
         item.update()
-        self._record_history()
+        self._schedule_history()
 
     def _alignment_changed(self) -> None:
         item = self._selected_item()
@@ -1118,7 +1353,7 @@ class MainWindow(QMainWindow):
             return
         item.annotation.alignment = self.align_combo.currentData()
         item.update()
-        self._record_history()
+        self._schedule_history()
 
     def _stroke_color_changed(self, color: str) -> None:
         item = self._selected_item()
@@ -1127,7 +1362,7 @@ class MainWindow(QMainWindow):
         item.annotation.stroke_color = color
         item.update()
         self.scene.defaults["stroke_color"] = color
-        self._record_history()
+        self._schedule_history()
 
     def _stroke_width_changed(self, value: float) -> None:
         item = self._selected_item()
@@ -1137,7 +1372,7 @@ class MainWindow(QMainWindow):
         item.prepareGeometryChange()
         item.update()
         self.scene.defaults["stroke_width"] = value
-        self._record_history()
+        self._schedule_history()
 
     def _fill_toggled(self, checked: bool) -> None:
         item = self._selected_item()
@@ -1147,7 +1382,7 @@ class MainWindow(QMainWindow):
         self.opacity_slider.setValue(int(item.annotation.fill_opacity * 100))
         item.update()
         self.scene.defaults["fill_opacity"] = item.annotation.fill_opacity
-        self._record_history()
+        self._schedule_history()
 
     def _fill_color_changed(self, color: str) -> None:
         item = self._selected_item()
@@ -1156,7 +1391,7 @@ class MainWindow(QMainWindow):
         item.annotation.fill_color = color
         item.update()
         self.scene.defaults["fill_color"] = color
-        self._record_history()
+        self._schedule_history()
 
     def _opacity_changed(self, value: int) -> None:
         item = self._selected_item()
@@ -1166,12 +1401,14 @@ class MainWindow(QMainWindow):
         self.fill_check.setChecked(value > 0)
         item.update()
         self.scene.defaults["fill_opacity"] = item.annotation.fill_opacity
-        self._record_history()
+        self._schedule_history()
 
     def _tool_action_triggered(self) -> None:
         action = self.sender()
         if isinstance(action, QAction):
             self.scene.set_tool(action.data())
+            self._update_guidance()
+            self.statusBar().showMessage(TOOL_HELP.get(action.data(), action.text()), 2500)
 
     def _selected_item(self) -> AnnotationItem | None:
         for item in self.scene.selectedItems():
@@ -1212,13 +1449,40 @@ class MainWindow(QMainWindow):
         return json.dumps(annotations_to_dicts(self.annotations), ensure_ascii=False, sort_keys=True)
 
     def _reset_history(self, *, mark_dirty: bool) -> None:
+        self._history_timer.stop()
+        self._pending_history_mark_dirty = False
         self.history = []
         self.history_index = -1
         self._record_history(mark_dirty=mark_dirty)
 
+    def _schedule_history(self, *, mark_dirty: bool = True) -> None:
+        if self._restoring_history:
+            return
+        if mark_dirty:
+            self.dirty = True
+            self._update_title()
+            self._update_actions()
+        self._pending_history_mark_dirty = self._pending_history_mark_dirty or mark_dirty
+        self._history_timer.start(HISTORY_DEBOUNCE_MS)
+
+    def _record_pending_history(self) -> None:
+        mark_dirty = self._pending_history_mark_dirty
+        self._pending_history_mark_dirty = False
+        self._record_history(mark_dirty=mark_dirty)
+
+    def _flush_pending_history(self) -> None:
+        if not self._history_timer.isActive():
+            return
+        self._history_timer.stop()
+        self._record_pending_history()
+
     def _record_history(self, *, mark_dirty: bool = True) -> None:
         if self._restoring_history:
             return
+        if self._history_timer.isActive():
+            self._history_timer.stop()
+            mark_dirty = mark_dirty or self._pending_history_mark_dirty
+            self._pending_history_mark_dirty = False
         snapshot = self._snapshot()
         if self.history_index >= 0 and self.history[self.history_index] == snapshot:
             return
@@ -1248,6 +1512,8 @@ class MainWindow(QMainWindow):
         self._update_actions()
 
     def _maybe_save(self) -> bool:
+        self._commit_inline_editor()
+        self._flush_pending_history()
         if not self.dirty:
             return True
         result = QMessageBox.question(
@@ -1267,13 +1533,19 @@ class MainWindow(QMainWindow):
 
     def _close_document(self) -> None:
         self._commit_inline_editor()
+        self._zoom_render_timer.stop()
+        self._history_timer.stop()
+        self._pending_history_mark_dirty = False
+        self._clear_page_pixmap_cache()
         if self.pdf_doc:
             self.pdf_doc.close()
         self.pdf_doc = None
         self.pdf_path = None
         self.edit_path = None
         self.annotations = []
-        self.scene.clear()
+        self._page_list_labels = []
+        self._show_empty_guide()
+        self._update_guidance()
 
     def _has_document(self) -> bool:
         return self.pdf_doc is not None and self.pdf_path is not None
