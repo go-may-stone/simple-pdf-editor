@@ -11,8 +11,12 @@ from PySide6.QtGui import (
     QActionGroup,
     QColor,
     QFont,
+    QIcon,
     QImage,
     QKeySequence,
+    QPainter,
+    QPalette,
+    QPen,
     QPixmap,
     QTransform,
 )
@@ -21,6 +25,8 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDockWidget,
     QDoubleSpinBox,
     QFileDialog,
@@ -191,6 +197,20 @@ class InlineTextEdit(QTextEdit):
             event.accept()
             return
         super().keyPressEvent(event)
+
+
+class PageSpinBox(QSpinBox):
+    def stepBy(self, steps: int) -> None:
+        super().stepBy(-steps)
+
+    def stepEnabled(self):
+        enabled = super().stepEnabled()
+        reversed_enabled = self.StepEnabledFlag.StepNone
+        if enabled & self.StepEnabledFlag.StepUpEnabled:
+            reversed_enabled |= self.StepEnabledFlag.StepDownEnabled
+        if enabled & self.StepEnabledFlag.StepDownEnabled:
+            reversed_enabled |= self.StepEnabledFlag.StepUpEnabled
+        return reversed_enabled
 
 
 class PdfGraphicsView(QGraphicsView):
@@ -420,6 +440,7 @@ class MainWindow(QMainWindow):
         self._inline_proxy: QGraphicsProxyWidget | None = None
         self._inline_annotation_id: str | None = None
         self._inline_item: AnnotationItem | None = None
+        self._usage_help_dialog: QDialog | None = None
 
         self._page_pixmap_cache: OrderedDict[tuple[int, float], tuple[QPixmap, int]] = OrderedDict()
         self._page_pixmap_cache_bytes = 0
@@ -532,12 +553,12 @@ class MainWindow(QMainWindow):
         self._set_action_help(self.back_action, "選択中の項目を背面に移動します。")
         self.back_action.triggered.connect(self.send_to_back)
 
-        self.zoom_in_action = QAction(style.standardIcon(QStyle.StandardPixmap.SP_ArrowUp), "拡大", self)
+        self.zoom_in_action = QAction(self._zoom_icon(zoom_in=True), "拡大", self)
         self.zoom_in_action.setShortcut(QKeySequence.StandardKey.ZoomIn)
         self._set_action_help(self.zoom_in_action, "表示を拡大します。Ctrl+ホイールでも操作できます。")
         self.zoom_in_action.triggered.connect(lambda: self.change_zoom(1))
 
-        self.zoom_out_action = QAction(style.standardIcon(QStyle.StandardPixmap.SP_ArrowDown), "縮小", self)
+        self.zoom_out_action = QAction(self._zoom_icon(zoom_in=False), "縮小", self)
         self.zoom_out_action.setShortcut(QKeySequence.StandardKey.ZoomOut)
         self._set_action_help(self.zoom_out_action, "表示を縮小します。Ctrl+ホイールでも操作できます。")
         self.zoom_out_action.triggered.connect(lambda: self.change_zoom(-1))
@@ -573,6 +594,26 @@ class MainWindow(QMainWindow):
         self.addAction(self.delete_action)
         self.addAction(self.undo_action)
         self.addAction(self.redo_action)
+
+    def _zoom_icon(self, *, zoom_in: bool) -> QIcon:
+        icon = QIcon()
+        for size in (18, 36, 54, 72):
+            pixmap = QPixmap(size, size)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.scale(size / 24, size / 24)
+            pen = QPen(self.palette().color(QPalette.ColorRole.ButtonText), 1.8)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.drawEllipse(QRectF(3, 3, 14, 14))
+            painter.drawLine(QPointF(15, 15), QPointF(21, 21))
+            painter.drawLine(QPointF(7, 10), QPointF(13, 10))
+            if zoom_in:
+                painter.drawLine(QPointF(10, 7), QPointF(10, 13))
+            painter.end()
+            icon.addPixmap(pixmap)
+        return icon
 
     def _set_action_help(self, action: QAction, text: str) -> None:
         action.setToolTip(text)
@@ -616,11 +657,11 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.redo_action)
         toolbar.addSeparator()
         toolbar.addAction(self.prev_page_action)
-        self.page_spin = QSpinBox(self)
+        self.page_spin = PageSpinBox(self)
         self.page_spin.setMinimum(1)
         self.page_spin.setMaximum(1)
         self.page_spin.setFixedWidth(78)
-        self.page_spin.setToolTip("ページ番号を入力して移動します。")
+        self.page_spin.setToolTip("ページ番号を入力して移動します。上矢印で前のページ、下矢印で次のページへ移動します。")
         toolbar.addWidget(self.page_spin)
         toolbar.addAction(self.next_page_action)
         toolbar.addSeparator()
@@ -749,7 +790,26 @@ class MainWindow(QMainWindow):
         guide.setPos(80, 120)
 
     def show_usage_help(self) -> None:
-        QMessageBox.information(self, "使い方", USAGE_HELP_TEXT)
+        if self._usage_help_dialog is None:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("使い方")
+            dialog.resize(640, 440)
+            layout = QVBoxLayout(dialog)
+
+            text = QTextEdit(dialog)
+            text.setReadOnly(True)
+            text.setPlainText(USAGE_HELP_TEXT)
+            layout.addWidget(text)
+
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
+            buttons.button(QDialogButtonBox.StandardButton.Close).setText("閉じる")
+            buttons.rejected.connect(dialog.reject)
+            layout.addWidget(buttons)
+            self._usage_help_dialog = dialog
+
+        self._usage_help_dialog.show()
+        self._usage_help_dialog.raise_()
+        self._usage_help_dialog.activateWindow()
 
     def _guidance_text(self) -> str:
         if not self._has_document():
