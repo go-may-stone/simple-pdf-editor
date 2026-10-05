@@ -3,9 +3,9 @@ from __future__ import annotations
 from math import atan2, cos, sin
 from pathlib import Path
 
-import fitz
+import pymupdf
 from PySide6.QtCore import QBuffer, QIODevice, QRectF, Qt
-from PySide6.QtGui import QBrush, QColor, QFont, QGuiApplication, QImage, QPainter, QPen, QTextOption
+from PySide6.QtGui import QBrush, QColor, QFont, QGuiApplication, QImage, QImageWriter, QPainter, QPen, QTextOption
 
 from .models import ARROW_KIND, ELLIPSE_KIND, LINE_KIND, RECT_KIND, TEXT_KIND, Annotation
 
@@ -23,7 +23,7 @@ def export_pdf(source_pdf: str | Path, output_pdf: str | Path, annotations: list
     for annotation in annotations:
         grouped.setdefault(annotation.page, []).append(annotation)
 
-    doc = fitz.open(str(source_path))
+    doc = pymupdf.open(str(source_path))
     try:
         for page_index, page_annotations in grouped.items():
             if page_index < 0 or page_index >= doc.page_count:
@@ -38,7 +38,7 @@ def export_pdf(source_pdf: str | Path, output_pdf: str | Path, annotations: list
         doc.close()
 
 
-def _draw_annotation(page: fitz.Page, annotation: Annotation) -> None:
+def _draw_annotation(page: pymupdf.Page, annotation: Annotation) -> None:
     if annotation.kind == TEXT_KIND:
         _draw_text(page, annotation)
     elif annotation.kind == RECT_KIND:
@@ -51,8 +51,8 @@ def _draw_annotation(page: fitz.Page, annotation: Annotation) -> None:
         _draw_line(page, annotation, arrow=True)
 
 
-def _draw_text(page: fitz.Page, annotation: Annotation) -> None:
-    rect = fitz.Rect(
+def _draw_text(page: pymupdf.Page, annotation: Annotation) -> None:
+    rect = pymupdf.Rect(
         annotation.x,
         annotation.y,
         annotation.x + max(1.0, annotation.w),
@@ -62,7 +62,7 @@ def _draw_text(page: fitz.Page, annotation: Annotation) -> None:
     page.insert_image(rect, stream=stream, overlay=True, keep_proportion=False)
 
 
-def _draw_rect(page: fitz.Page, annotation: Annotation) -> None:
+def _draw_rect(page: pymupdf.Page, annotation: Annotation) -> None:
     rect = _normalized_rect(annotation)
     page.draw_rect(
         rect,
@@ -74,7 +74,7 @@ def _draw_rect(page: fitz.Page, annotation: Annotation) -> None:
     )
 
 
-def _draw_ellipse(page: fitz.Page, annotation: Annotation) -> None:
+def _draw_ellipse(page: pymupdf.Page, annotation: Annotation) -> None:
     rect = _normalized_rect(annotation)
     page.draw_oval(
         rect,
@@ -86,9 +86,9 @@ def _draw_ellipse(page: fitz.Page, annotation: Annotation) -> None:
     )
 
 
-def _draw_line(page: fitz.Page, annotation: Annotation, *, arrow: bool) -> None:
-    start = fitz.Point(annotation.x, annotation.y)
-    end = fitz.Point(annotation.x + annotation.w, annotation.y + annotation.h)
+def _draw_line(page: pymupdf.Page, annotation: Annotation, *, arrow: bool) -> None:
+    start = pymupdf.Point(annotation.x, annotation.y)
+    end = pymupdf.Point(annotation.x + annotation.w, annotation.y + annotation.h)
     color = _rgb(annotation.stroke_color) or (0, 0, 0)
     width = max(0.1, annotation.stroke_width)
     page.draw_line(start, end, color=color, width=width, overlay=True)
@@ -97,7 +97,7 @@ def _draw_line(page: fitz.Page, annotation: Annotation, *, arrow: bool) -> None:
         _draw_arrow_head(page, start, end, color, width)
 
 
-def _draw_arrow_head(page: fitz.Page, start: fitz.Point, end: fitz.Point, color: tuple[float, float, float], width: float) -> None:
+def _draw_arrow_head(page: pymupdf.Page, start: pymupdf.Point, end: pymupdf.Point, color: tuple[float, float, float], width: float) -> None:
     dx = end.x - start.x
     dy = end.y - start.y
     if abs(dx) < 0.01 and abs(dy) < 0.01:
@@ -106,18 +106,18 @@ def _draw_arrow_head(page: fitz.Page, start: fitz.Point, end: fitz.Point, color:
     angle = atan2(dy, dx)
     length = max(12.0, width * 5.0)
     spread = 0.55
-    p1 = fitz.Point(end.x - length * cos(angle - spread), end.y - length * sin(angle - spread))
-    p2 = fitz.Point(end.x - length * cos(angle + spread), end.y - length * sin(angle + spread))
+    p1 = pymupdf.Point(end.x - length * cos(angle - spread), end.y - length * sin(angle - spread))
+    p2 = pymupdf.Point(end.x - length * cos(angle + spread), end.y - length * sin(angle + spread))
     page.draw_line(end, p1, color=color, width=width, overlay=True)
     page.draw_line(end, p2, color=color, width=width, overlay=True)
 
 
-def _normalized_rect(annotation: Annotation) -> fitz.Rect:
+def _normalized_rect(annotation: Annotation) -> pymupdf.Rect:
     x1 = annotation.x
     y1 = annotation.y
     x2 = annotation.x + annotation.w
     y2 = annotation.y + annotation.h
-    return fitz.Rect(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+    return pymupdf.Rect(min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
 
 
 def _rgb(value: str) -> tuple[float, float, float] | None:
@@ -193,8 +193,10 @@ def _render_text_annotation_png(annotation: Annotation) -> bytes:
 
     buffer = QBuffer()
     buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-    image.save(buffer, "PNG")
-    return bytes(buffer.data())
+    writer = QImageWriter(buffer, b"PNG")
+    if not writer.write(image):
+        raise RuntimeError(f"文字の画像を書き出せませんでした: {writer.errorString()}")
+    return bytes(buffer.data().data())
 
 
 def _ensure_qt_app() -> None:

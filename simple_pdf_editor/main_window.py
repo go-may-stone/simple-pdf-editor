@@ -4,8 +4,8 @@ from collections import OrderedDict
 import json
 from pathlib import Path
 
-import fitz
-from PySide6.QtCore import QMimeData, QPoint, QPointF, QRectF, QSignalBlocker, QSize, Qt, QTimer, Signal
+import pymupdf
+from PySide6.QtCore import QMimeData, QPoint, QPointF, QRectF, QSignalBlocker, QSize, QStandardPaths, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -423,7 +423,7 @@ class PdfScene(QGraphicsScene):
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.pdf_doc: fitz.Document | None = None
+        self.pdf_doc: pymupdf.Document | None = None
         self.pdf_path: Path | None = None
         self.edit_path: Path | None = None
         self.annotations: list[Annotation] = []
@@ -869,7 +869,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "PDFを開く",
-            str(Path.home()),
+            QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation) or str(Path.home()),
             "PDF / 編集ファイル (*.pdf *.pdfedit);;PDF (*.pdf);;PDF編集ファイル (*.pdfedit)",
         )
         if path:
@@ -888,7 +888,7 @@ class MainWindow(QMainWindow):
 
     def _open_pdf(self, path: Path) -> None:
         self._close_document()
-        self.pdf_doc = fitz.open(str(path))
+        self.pdf_doc = pymupdf.open(str(path))
         self.pdf_path = path.resolve()
         self.edit_path = None
         self.annotations = []
@@ -917,7 +917,7 @@ class MainWindow(QMainWindow):
             source_path = Path(replacement)
 
         self._close_document()
-        self.pdf_doc = fitz.open(str(source_path))
+        self.pdf_doc = pymupdf.open(str(source_path))
         self.pdf_path = source_path.resolve()
         self.edit_path = path.resolve()
         self.annotations = annotations
@@ -932,12 +932,12 @@ class MainWindow(QMainWindow):
         self._update_actions()
 
     def save_edit(self) -> bool:
-        if not self._has_document():
+        if self.pdf_doc is None or self.pdf_path is None:
             return False
         self._commit_inline_editor()
         self._flush_pending_history()
         if self.edit_path is None:
-            default_path = self.pdf_path.with_suffix(".pdfedit") if self.pdf_path else Path.home() / "untitled.pdfedit"
+            default_path = self.pdf_path.with_suffix(".pdfedit")
             path, _ = QFileDialog.getSaveFileName(
                 self,
                 "編集状態を保存",
@@ -959,11 +959,11 @@ class MainWindow(QMainWindow):
         return True
 
     def export_pdf(self) -> None:
-        if not self._has_document():
+        if self.pdf_doc is None or self.pdf_path is None:
             return
         self._commit_inline_editor()
         self._flush_pending_history()
-        default_path = self.pdf_path.with_name(f"{self.pdf_path.stem}_edited.pdf") if self.pdf_path else Path.home() / "edited.pdf"
+        default_path = self.pdf_path.with_name(f"{self.pdf_path.stem}_edited.pdf")
         path, _ = QFileDialog.getSaveFileName(
             self,
             "PDFとして出力",
@@ -980,7 +980,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"PDFを出力しました: {Path(path).name}", 5000)
 
     def go_to_page(self, page_index: int) -> None:
-        if not self._has_document():
+        if self.pdf_doc is None or self.pdf_path is None:
             return
         if page_index < 0 or page_index >= self.pdf_doc.page_count:
             self._sync_page_controls()
@@ -1176,7 +1176,7 @@ class MainWindow(QMainWindow):
 
     def _render_current_page(self) -> None:
         self._zoom_render_timer.stop()
-        if not self._has_document():
+        if self.pdf_doc is None or self.pdf_path is None:
             self._show_empty_guide()
             self._update_guidance()
             return
@@ -1204,6 +1204,8 @@ class MainWindow(QMainWindow):
         self._update_guidance()
 
     def _page_pixmap(self, page_index: int, render_scale: float) -> QPixmap:
+        if self.pdf_doc is None:
+            raise RuntimeError("PDFが開かれていません。")
         key = (page_index, self._render_scale_key(render_scale))
         cached = self._page_pixmap_cache.pop(key, None)
         if cached is not None:
@@ -1211,7 +1213,7 @@ class MainWindow(QMainWindow):
             return cached[0]
 
         page = self.pdf_doc[page_index]
-        pix = page.get_pixmap(matrix=fitz.Matrix(render_scale, render_scale), alpha=False)
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(render_scale, render_scale), alpha=False)
         image = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888).copy()
         pixmap = QPixmap.fromImage(image)
         cost = pixmap.width() * pixmap.height() * max(1, pixmap.depth() // 8)
@@ -1238,7 +1240,7 @@ class MainWindow(QMainWindow):
         return round(render_scale, 3)
 
     def _populate_page_list(self) -> None:
-        if not self._has_document():
+        if self.pdf_doc is None or self.pdf_path is None:
             self.page_list.clear()
             self._page_list_labels = []
             return
@@ -1256,7 +1258,7 @@ class MainWindow(QMainWindow):
         blockers.clear()
 
     def _sync_page_controls(self) -> None:
-        if not self._has_document():
+        if self.pdf_doc is None or self.pdf_path is None:
             self.page_spin.setMaximum(1)
             self.page_spin.setValue(1)
             self.page_status_label.setText("ページ -/-")
@@ -1268,7 +1270,7 @@ class MainWindow(QMainWindow):
         blockers.clear()
 
     def _update_status(self) -> None:
-        if self._has_document():
+        if self.pdf_doc is not None and self.pdf_path is not None:
             self.page_status_label.setText(f"ページ {self.current_page + 1}/{self.pdf_doc.page_count}")
         else:
             self.page_status_label.setText("ページ -/-")
